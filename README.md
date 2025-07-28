@@ -14,7 +14,8 @@ Inc/dht11.h
 ## Configuration & Usage Guide
 ### 1. Timer Selection
 
-In your dht11.h file, define the timer you wish to use:
+In your dht11.h file, define the timer you wish to use and also enable any timer in cubemx if you are using it, if not using any timer in your projects 
+preferably enable timer that you will be using for dht11:
 
     #define DHT_TIM_6
 
