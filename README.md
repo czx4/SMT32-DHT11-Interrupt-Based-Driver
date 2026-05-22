@@ -32,7 +32,7 @@ Also define the GPIO port and pin used for communication with the DHT11 sensor:
 Supported Pins:
 DHT_GPIO_PIN_0 through DHT_GPIO_PIN_15
 
->  **⚠️ Note:**
+>  ** Note:**
 >   If your selected Timer or GPIO pin isn't supported out of the box, you can add support manually by replicating the define pattern in the dht11.c file.
 
 ### 3. Including the Driver
