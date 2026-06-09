@@ -1,478 +1,229 @@
 #include "dht11.h"
-#include<string.h>
+
+static void handle_uninit(void);
+static void handle_ready(void);
+static void handle_pd_start(void);
+static void handle_dht_init(void);
+static void handle_during_transmit(void);
+static void handle_stab(void);
 
 
-static uint8_t state;
-static uint8_t data_index=0;
-static uint8_t data[5]={0};
-static uint8_t *temperature;
-static uint8_t *humidity;
-static uint8_t readComplete=1;
-static uint8_t starting_conv=0;
-static uint8_t EXTI_enable;
+TIM_HandleTypeDef DHT11_tim;
 
-void DHT11_StateMachine(void);
-void DHT11_GPIO_EDGE(void);
-static uint32_t get_pclk1_prescaler(void);
-static uint32_t get_pclk2_prescaler(void);
-static void (*dht_callback)(DHT11_StatusTypeDef status) = NULL;
-
-
-
-#ifdef DHT_TIM_1
-static TIM_HandleTypeDef htim1;
-#define DHT_TIM_IRQn TIM1_UP_TIM16_IRQn
-#define DHT_HTIM (&htim1)
-#define DHT_TIM_INSTANCE TIM1
-void TIM1_UP_TIM16_IRQHandler(void) {
-    HAL_TIM_IRQHandler(DHT_HTIM);
-}
-#endif
-
-#ifdef DHT_TIM_2
-static TIM_HandleTypeDef htim2;
-#define DHT_TIM_IRQn TIM2_IRQn
-#define DHT_HTIM (&htim2)
-#define DHT_TIM_INSTANCE TIM2
-void TIM2_IRQHandler(void)
+enum // setting are for 72 Mhz initial clock, start trigger should be at most 55,55Hz, target trigger should be 100khz and stab trigger 1hz
 {
-    HAL_TIM_IRQHandler(DHT_HTIM);
-}
-#endif
+    START_PRESCALER = 256-1, // for simplicity it will fire after 20ms as the datasheet doesnt name upper bound for pulling low 
+    START_AUTORELOAD = 5625-1, 
+    TARGET_PRESCALER = 72-1, // should fire every 10us
+    TARGET_AUTORELOAD = 10-1,
+    STAB_PRESCALER = 7200-1, // should fire every 1s (probably can go lower on that, but the datasheet states that 1 second is minimum)
+    STAB_AUTORELOAD = 10000-1,
+    MAX_WAIT_INTERVALS = 15
+};
 
-#ifdef DHT_TIM_3
-static TIM_HandleTypeDef htim3;
-#define DHT_TIM_IRQn TIM3_IRQn
-#define DHT_HTIM (&htim3)
-#define DHT_TIM_INSTANCE TIM3
-void TIM3_IRQHandler(void)
+typedef enum{
+    DURING_TRANSMIT,
+    TRANSMIT_START,
+    PULLUP_START_DHT,
+    PULLDOWN_START_DHT,
+    PULLUP_START,
+    PULLDOWN_START,
+    READY,
+    UNINIT,
+    STABILIZE_STATUS,
+    NUM_STATES
+} DHT_state;
+
+typedef void (*state_func)(void);
+
+static const state_func state_table[NUM_STATES] = 
 {
-    HAL_TIM_IRQHandler(DHT_HTIM);
-}
-#endif
+    [UNINIT] = handle_uninit,
+    [READY] = handle_ready,
+    [PULLDOWN_START] = handle_pd_start,
+    [PULLUP_START] = handle_dht_init,
+    [PULLDOWN_START_DHT] = handle_dht_init,
+    [PULLUP_START_DHT] = handle_dht_init,
+    [TRANSMIT_START] = handle_dht_init,
+    [DURING_TRANSMIT] = handle_during_transmit,
+    [STABILIZE_STATUS] = handle_stab
+};
 
-#ifdef DHT_TIM_4
-static TIM_HandleTypeDef htim4;
-#define DHT_TIM_IRQn TIM4_IRQn
-#define DHT_HTIM (&htim4)
-#define DHT_TIM_INSTANCE TIM4
-void TIM4_IRQHandler(void)
+static GPIO_TypeDef *GPIO_Port;
+static uint16_t GPIO_Pin;
+
+static volatile DHT_state current_state = UNINIT;
+static volatile uint8_t time_inc_passed = 0;
+
+static volatile uint8_t shift = 0;
+static volatile uint8_t packet_num = 0;
+static DHT11_data* data;
+volatile bool DHT11_data_ready = false;
+static volatile bool pin_state = GPIO_PIN_SET;
+static const uint8_t min_wait_intervals[] = {
+    [PULLUP_START] = 0,
+    [PULLDOWN_START_DHT] = 4,
+    [PULLUP_START_DHT] = 6,
+    [TRANSMIT_START] = 3,
+    [DURING_TRANSMIT] = 5
+};
+
+void DHT11_Service_Callback(void)
 {
-    HAL_TIM_IRQHandler(DHT_HTIM);
+    state_table[current_state]();
 }
-#endif
 
-#ifdef DHT_TIM_6
-static TIM_HandleTypeDef htim6;
-#define DHT_TIM_IRQn TIM6_DAC_IRQn
-#define DHT_HTIM (&htim6)
-#define DHT_TIM_INSTANCE TIM6
-void TIM6_DAC_IRQHandler(void)
+uint8_t DHT11_Init(TIM_TypeDef *TIM_instance, GPIO_TypeDef *GPIO_PORT, uint16_t GPIO_PIN)
 {
-    HAL_TIM_IRQHandler(DHT_HTIM);
-}
-#endif
+    GPIO_Port = GPIO_PORT;
+    GPIO_Pin = GPIO_PIN;
+    
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    DHT11_tim.Instance = TIM_instance;
+    DHT11_tim.Init.Prescaler = START_PRESCALER;
+    DHT11_tim.Init.CounterMode = TIM_COUNTERMODE_UP;
+    DHT11_tim.Init.Period = START_AUTORELOAD;
+    DHT11_tim.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 
-#ifdef DHT_TIM_7
-static TIM_HandleTypeDef htim7;
-#define DHT_TIM_IRQn TIM7_IRQn
-#define DHT_HTIM (&htim7)
-#define DHT_TIM_INSTANCE TIM7
-void TIM7_IRQHandler(void)
+    if (HAL_TIM_Base_Init(&DHT11_tim) != HAL_OK){
+        return DHT11_ERROR;
+    }
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&DHT11_tim, &sMasterConfig) != HAL_OK)
+    {
+        return DHT11_ERROR;
+    }
+
+    HAL_GPIO_DeInit(GPIO_Port, GPIO_Pin);
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIO_Port, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIO_Port, GPIO_Pin, GPIO_PIN_SET);
+
+    current_state = READY;
+
+    return DHT11_OK;
+}
+
+uint8_t DHT11_Read(DHT11_data *data_ptr)
 {
-    HAL_TIM_IRQHandler(DHT_HTIM);
+    if (current_state != READY)
+        return DHT11_ERROR;
+    current_state = PULLDOWN_START;
+    DHT11_data_ready = false;
+    HAL_GPIO_WritePin(GPIO_Port, GPIO_Pin, GPIO_PIN_RESET);
+    shift = 7;
+    packet_num = 0;
+    data = data_ptr;
+    time_inc_passed = 0;
+    pin_state = GPIO_PIN_SET;
+    memset((void *) data->raw, 0, sizeof(*data));
+    __HAL_TIM_SET_COUNTER(&DHT11_tim,0);
+    __HAL_TIM_SET_PRESCALER(&DHT11_tim, START_PRESCALER);
+    __HAL_TIM_SET_AUTORELOAD(&DHT11_tim, START_AUTORELOAD);
+    __HAL_TIM_CLEAR_IT(&DHT11_tim, TIM_IT_UPDATE);
+    if(HAL_TIM_Base_Start_IT(&DHT11_tim) != HAL_OK)
+        return DHT11_ERROR;
+    return DHT11_OK;
 }
-#endif
 
-#ifdef DHT_TIM_8
-static TIM_HandleTypeDef htim8;
-#define DHT_TIM_IRQn TIM8_UP_IRQn
-#define DHT_HTIM (&htim8)
-#define DHT_TIM_INSTANCE TIM8
-void TIM8_UP_IRQHandler(void) {
-    HAL_TIM_IRQHandler(DHT_HTIM);
+static void process_data(void)
+{
+    __HAL_TIM_SET_COUNTER(&DHT11_tim,0);
+    __HAL_TIM_SET_PRESCALER(&DHT11_tim, STAB_PRESCALER);
+    __HAL_TIM_SET_AUTORELOAD(&DHT11_tim, STAB_AUTORELOAD);
+    current_state = STABILIZE_STATUS;
+    HAL_GPIO_WritePin(GPIO_Port, GPIO_Pin, GPIO_PIN_SET);
+    uint16_t sum = data->values.integral_rh + data->values.fraction_rh + data->values.integral_temp + data->values.fraction_temp;
+    if((sum & 0xFF) != data->values.checksum)
+    {
+        memset((void *)data->raw, 255, sizeof(*data));
+    }
+    DHT11_data_ready = true;
 }
-#endif
 
-#ifdef DHT_TIM_15
-static TIM_HandleTypeDef htim15;
-#define DHT_TIM_IRQn TIM1_BRK_TIM15_IRQn
-#define DHT_HTIM (&htim15)
-#define DHT_TIM_INSTANCE TIM15
-void TIM1_BRK_TIM15_IRQHandler(void) {
-    HAL_TIM_IRQHandler(DHT_HTIM);
+static void error_reading(void)
+{
+    __HAL_TIM_SET_COUNTER(&DHT11_tim,0);
+    __HAL_TIM_SET_PRESCALER(&DHT11_tim, STAB_PRESCALER);
+    __HAL_TIM_SET_AUTORELOAD(&DHT11_tim, STAB_AUTORELOAD);
+    current_state = STABILIZE_STATUS;
+    HAL_GPIO_WritePin(GPIO_Port, GPIO_Pin, GPIO_PIN_SET);
+    memset((void *)data->raw, 255, sizeof(*data));
+    DHT11_data_ready = true;
 }
-#endif
 
-#ifdef DHT_TIM_16
-static TIM_HandleTypeDef htim16;
-#define DHT_TIM_IRQn TIM1_UP_TIM16_IRQn
-#define DHT_HTIM (&htim16)
-#define DHT_TIM_INSTANCE TIM16
-void TIM1_UP_TIM16_IRQHandler(void) {
-    HAL_TIM_IRQHandler(DHT_HTIM);
+static void handle_stab(void)
+{
+    HAL_TIM_Base_Stop_IT(&DHT11_tim);
+    current_state = READY;
 }
-#endif
 
-#ifdef DHT_TIM_17
-static TIM_HandleTypeDef htim17;
-#define DHT_TIM_IRQn TIM1_TRG_COM_TIM17_IRQn
-#define DHT_HTIM (&htim17)
-#define DHT_TIM_INSTANCE TIM17
-void TIM1_TRG_COM_TIM17_IRQHandler(void) {
-    HAL_TIM_IRQHandler(DHT_HTIM);
+static void handle_uninit(void)
+{
+    HAL_TIM_Base_Stop_IT(&DHT11_tim);
+    HAL_GPIO_WritePin(GPIO_Port, GPIO_Pin, GPIO_PIN_SET);
+    memset((void *)data->raw, 255, sizeof(*data));
+    DHT11_data_ready = true;
 }
-#endif
 
-#ifdef DHT_GPIO_PIN_0
-#define DHT_GPIO_PIN GPIO_PIN_0
-#define DHT_EXTI_IRQn EXTI0_IRQn
-void EXTI0_IRQHandler(void) {
-	HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
+static void handle_ready(void)
+{
+    error_reading();
 }
-#endif
 
-#ifdef DHT_GPIO_PIN_1
-#define DHT_GPIO_PIN GPIO_PIN_1
-#define DHT_EXTI_IRQn EXTI1_IRQn
-void EXTI1_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
+static void handle_pd_start(void)
+{
+    HAL_GPIO_WritePin(GPIO_Port, GPIO_Pin, GPIO_PIN_SET);
+    current_state = PULLUP_START;
+    __HAL_TIM_SET_COUNTER(&DHT11_tim, 0);
+    __HAL_TIM_SET_PRESCALER(&DHT11_tim, TARGET_PRESCALER);
+    __HAL_TIM_SET_AUTORELOAD(&DHT11_tim, TARGET_AUTORELOAD);
 }
-#endif
 
-#ifdef DHT_GPIO_PIN_2
-#define DHT_GPIO_PIN GPIO_PIN_2
-#define DHT_EXTI_IRQn EXTI2_TSC_IRQn
-void EXTI2_TSC_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
+static void handle_dht_init(void)
+{
+    if(HAL_GPIO_ReadPin(GPIO_Port, GPIO_Pin) != pin_state)
+    {
+        if(time_inc_passed < min_wait_intervals[current_state])
+        {
+            error_reading();
+            return;
+        }
+        pin_state = !pin_state;
+        time_inc_passed = 0;
+        --current_state;
+    }
+
+    if(++time_inc_passed == MAX_WAIT_INTERVALS)
+        error_reading();
 }
-#endif
 
-#ifdef DHT_GPIO_PIN_3
-#define DHT_GPIO_PIN GPIO_PIN_3
-#define DHT_EXTI_IRQn EXTI3_IRQn
-void EXTI3_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
+static void handle_during_transmit(void)
+{
+    if(HAL_GPIO_ReadPin(GPIO_Port, GPIO_Pin) == GPIO_PIN_RESET)
+    {
+        if(time_inc_passed > min_wait_intervals[current_state]) //1
+        {
+            data->raw[packet_num] |= (1<<shift);
+        }
+        if(--shift > 7)
+        {
+            ++packet_num;
+            shift = 7;
+        }
+        //0
+        pin_state = GPIO_PIN_RESET;
+        time_inc_passed = 0;
+        current_state = TRANSMIT_START;
+        return;
+    }
 
-#ifdef DHT_GPIO_PIN_4
-#define DHT_GPIO_PIN GPIO_PIN_4
-#define DHT_EXTI_IRQn EXTI4_IRQn
-void EXTI4_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_5
-#define DHT_GPIO_PIN GPIO_PIN_5
-#define DHT_EXTI_IRQn EXTI9_5_IRQn
-void EXTI9_5_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_6
-#define DHT_GPIO_PIN GPIO_PIN_6
-#define DHT_EXTI_IRQn EXTI9_5_IRQn
-void EXTI9_5_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_7
-#define DHT_GPIO_PIN GPIO_PIN_7
-#define DHT_EXTI_IRQn EXTI9_5_IRQn
-void EXTI9_5_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_8
-#define DHT_GPIO_PIN GPIO_PIN_8
-#define DHT_EXTI_IRQn EXTI9_5_IRQn
-void EXTI9_5_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_9
-#define DHT_GPIO_PIN GPIO_PIN_9
-#define DHT_EXTI_IRQn EXTI9_5_IRQn
-void EXTI9_5_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_10
-#define DHT_GPIO_PIN GPIO_PIN_10
-#define DHT_EXTI_IRQn EXTI15_10_IRQn
-void EXTI15_10_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_11
-#define DHT_GPIO_PIN GPIO_PIN_11
-#define DHT_EXTI_IRQn EXTI15_10_IRQn
-void EXTI15_10_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_12
-#define DHT_GPIO_PIN GPIO_PIN_12
-#define DHT_EXTI_IRQn EXTI15_10_IRQn
-void EXTI15_10_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_13
-#define DHT_GPIO_PIN GPIO_PIN_13
-#define DHT_EXTI_IRQn EXTI15_10_IRQn
-void EXTI15_10_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_14
-#define DHT_GPIO_PIN GPIO_PIN_14
-#define DHT_EXTI_IRQn EXTI15_10_IRQn
-void EXTI15_10_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-#ifdef DHT_GPIO_PIN_15
-#define DHT_GPIO_PIN GPIO_PIN_15
-#define DHT_EXTI_IRQn EXTI15_10_IRQn
-void EXTI15_10_IRQHandler(void) {
-    HAL_GPIO_EXTI_IRQHandler(DHT_GPIO_PIN);
-}
-#endif
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim == DHT_HTIM) {
-        DHT11_StateMachine();
+    if(++time_inc_passed == MAX_WAIT_INTERVALS){
+        process_data();
     }
 }
-
-void HAL_GPIO_EXTI_Callback(uint16_t pin){
-	if(pin==DHT_GPIO_PIN){
-		DHT11_GPIO_EDGE();
-	}
-}
-
-
-TIM_HandleTypeDef *DHT11_GetTIMHandle(void){
-	return DHT_HTIM;
-}
-uint16_t DHT11_GetPin(void){
-	return DHT_GPIO_PIN;
-}
-
-
-void DHT11_Init(void){
-#ifdef DHT_TIM_1
-__HAL_RCC_TIM1_CLK_ENABLE();
-#endif
-
-#ifdef DHT_TIM_2
-__HAL_RCC_TIM2_CLK_ENABLE();
-#endif
-
-#ifdef DHT_TIM_3
-__HAL_RCC_TIM3_CLK_ENABLE();
-#endif
-
-#ifdef DHT_TIM_4
-__HAL_RCC_TIM4_CLK_ENABLE();
-#endif
-
-#ifdef DHT_TIM_6
-__HAL_RCC_TIM6_CLK_ENABLE();
-#endif
-
-#ifdef DHT_TIM_7
-__HAL_RCC_TIM7_CLK_ENABLE();
-#endif
-
-#ifdef DHT_TIM_8
-__HAL_RCC_TIM8_CLK_ENABLE();
-#endif
-
-#ifdef DHT_TIM_15
-__HAL_RCC_TIM15_CLK_ENABLE();
-#endif
-
-#ifdef DHT_TIM_16
-__HAL_RCC_TIM16_CLK_ENABLE();
-#endif
-
-#ifdef DHT_TIM_17
-__HAL_RCC_TIM17_CLK_ENABLE();
-#endif
-	GPIO_InitTypeDef GPIO_InitStruct={0};
-	GPIO_InitStruct.Pin=DHT_GPIO_PIN;
-	GPIO_InitStruct.Mode=GPIO_MODE_OUTPUT_OD;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	HAL_GPIO_Init(DHT_GPIO_PORT, &GPIO_InitStruct);
-
-	uint32_t timerClockFreq;
-
-	if (DHT_TIM_INSTANCE == TIM1 || //APB2
-		DHT_TIM_INSTANCE == TIM8 ||
-		DHT_TIM_INSTANCE== TIM15 ||
-		DHT_TIM_INSTANCE == TIM16 ||
-		DHT_TIM_INSTANCE == TIM17){
-	    timerClockFreq= HAL_RCC_GetPCLK2Freq();
-	    if (get_pclk2_prescaler()!= 1) {
-	        timerClockFreq *= 2;
-	    }
-	}
-	else{ //APB1
-		timerClockFreq=HAL_RCC_GetPCLK1Freq();
-		if (get_pclk1_prescaler() !=1) {
-		    timerClockFreq *= 2;
-		}
-	}
-	DHT_HTIM->Instance=DHT_TIM_INSTANCE;
-	DHT_HTIM->Init.Prescaler=(timerClockFreq/1000000)-1;
-	DHT_HTIM->Init.CounterMode=TIM_COUNTERMODE_UP;
-	DHT_HTIM->Init.Period=0xFFFF;
-	DHT_HTIM->Init.ClockDivision=TIM_CLOCKDIVISION_DIV1;
-	DHT_HTIM->Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-	HAL_TIM_Base_Init(DHT_HTIM);
-	HAL_NVIC_SetPriority(DHT_TIM_IRQn,0, 0);
-	HAL_NVIC_EnableIRQ(DHT_TIM_IRQn);
-	HAL_NVIC_SetPriority(DHT_EXTI_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DHT_EXTI_IRQn);
-}
-
-void DHT11_Read(uint8_t *temp,uint8_t *humi,void(*callback)(DHT11_StatusTypeDef status)){
-
-if(readComplete==0){
-	return;
-}
-readComplete=0;
-state=0;
-humidity=humi;
-temperature=temp;
-data_index=0;
-starting_conv=0;
-dht_callback=callback;
-memset(data,0,5*sizeof(data[0]));
-
-HAL_GPIO_WritePin(DHT_GPIO_PORT, DHT_GPIO_PIN, GPIO_PIN_RESET);
-__HAL_TIM_SET_AUTORELOAD(DHT_HTIM,20000);
-__HAL_TIM_SET_COUNTER(DHT_HTIM,0);
-__HAL_TIM_CLEAR_FLAG(DHT_HTIM, TIM_FLAG_UPDATE);
-__HAL_TIM_ENABLE_IT(DHT_HTIM, TIM_IT_UPDATE);
-HAL_TIM_Base_Start_IT(DHT_HTIM);
-}
-
-
-
-void DHT11_StateMachine(void){
-	switch(state){
-	case 0:
-		HAL_GPIO_WritePin(DHT_GPIO_PORT, DHT_GPIO_PIN, GPIO_PIN_SET);
-		__HAL_TIM_SET_AUTORELOAD(DHT_HTIM,40);
-		state++;
-		break;
-
-	case 1:
-		GPIO_InitTypeDef GPIO_InitStruct={0};
-		if(EXTI_enable==1){
-			EXTI_enable=0;
-			HAL_TIM_Base_Stop_IT(DHT_HTIM);
-			GPIO_InitStruct.Pin=DHT_GPIO_PIN;
-			GPIO_InitStruct.Mode=GPIO_MODE_OUTPUT_OD;
-			GPIO_InitStruct.Pull = GPIO_NOPULL;
-			GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-			HAL_GPIO_Init(DHT_GPIO_PORT, &GPIO_InitStruct);
-			HAL_GPIO_WritePin(DHT_GPIO_PORT, DHT_GPIO_PIN, GPIO_PIN_SET);
-			dht_callback(DHT11_TIMEOUT);
-			readComplete=1;
-			break;
-		}
-		GPIO_InitStruct.Pin=DHT_GPIO_PIN;
-		GPIO_InitStruct.Mode=GPIO_MODE_IT_RISING_FALLING;
-		GPIO_InitStruct.Pull=GPIO_NOPULL;
-		HAL_GPIO_Init(DHT_GPIO_PORT, &GPIO_InitStruct);
-		EXTI_enable=1;
-		__HAL_TIM_SET_AUTORELOAD(DHT_HTIM,1000000);
-		break;
-	case 2:
-		HAL_TIM_Base_Stop_IT(DHT_HTIM);
-		if(*humidity==255 && *temperature==255){
-			dht_callback(DHT11_CHECKSUM_MISMATCH);
-		}
-		else{
-			dht_callback(DHT11_OK);
-		}
-		readComplete=1;
-		break;
-	}
-}
-
-void DHT11_GPIO_EDGE(void){
-	if(EXTI_enable==0){
-		return;
-	}
-	if(starting_conv<2||data_index>=41){
-		starting_conv++;
-		return;
-	}
-	if(HAL_GPIO_ReadPin(DHT_GPIO_PORT, DHT_GPIO_PIN)){//rising
-		__HAL_TIM_SET_COUNTER(DHT_HTIM,0);
-	}
-	else{//falling
-		uint32_t time=__HAL_TIM_GET_COUNTER(DHT_HTIM);
-		data[data_index/8]<<=1;
-		if(time>50){
-			data[data_index/8]|=1;
-		}
-		else{
-			data[data_index/8]|=0;
-		}
-		data_index++;
-		if(data_index>=40){
-			GPIO_InitTypeDef GPIO_InitStruct={0};
-			GPIO_InitStruct.Pin=DHT_GPIO_PIN;
-			GPIO_InitStruct.Mode=GPIO_MODE_OUTPUT_OD;
-			GPIO_InitStruct.Pull = GPIO_NOPULL;
-			GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-			HAL_GPIO_Init(DHT_GPIO_PORT, &GPIO_InitStruct);
-			HAL_GPIO_WritePin(DHT_GPIO_PORT, DHT_GPIO_PIN, GPIO_PIN_SET);
-
-			__HAL_TIM_SET_COUNTER(DHT_HTIM,0);
-			__HAL_TIM_SET_AUTORELOAD(DHT_HTIM,1000000);
-			if ((data[0] + data[1] + data[2] + data[3]) == data[4]){
-				*humidity=data[0];
-				*temperature=data[2];
-			}
-			else{
-				*humidity=255;
-				*temperature=255;
-			}
-			state++;
-			EXTI_enable=0;
-		}
-	}
-}
-
-
-
-static uint32_t get_pclk1_prescaler(void) {
-    uint32_t tmp = (RCC->CFGR & RCC_CFGR_PPRE1) >> RCC_CFGR_PPRE1_Pos;
-    return (tmp < 4) ? 1 : (1 << (tmp - 3)); // 1, 2, 4, 8, 16
-}
-
-static uint32_t get_pclk2_prescaler(void) {
-    uint32_t tmp = (RCC->CFGR & RCC_CFGR_PPRE2) >> RCC_CFGR_PPRE2_Pos;
-    return (tmp < 4) ? 1 : (1 << (tmp - 3)); // 1, 2, 4, 8, 16
-}
-
